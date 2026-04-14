@@ -340,6 +340,75 @@ def sap_score(
 
 
 # ---------------------------------------------------------------------------
+# 4. BetaVAE metric
+# ---------------------------------------------------------------------------
+
+
+def beta_vae_metric(
+    representations: np.ndarray,
+    factors: np.ndarray,
+    n_train: int = 800,
+    n_eval: int = 200,
+) -> float:
+    """Compute the BetaVAE metric (Kim & Mnih 2018).
+
+    Trains a linear classifier to predict which generative factor was held
+    fixed when two images were sampled, using the absolute difference of their
+    latent representations as the input feature vector.
+
+    Parameters
+    ----------
+    representations : np.ndarray, shape (n, z_dim)
+    factors : np.ndarray, shape (n, n_factors)  – integer-valued
+    n_train : int
+        Number of difference-vector / label pairs for training.
+    n_eval : int
+        Number of pairs for evaluation.
+
+    Returns
+    -------
+    float in [0, 1]  (higher is more disentangled)
+    """
+    from sklearn.linear_model import LogisticRegression
+
+    n, z_dim = representations.shape
+    n_factors = factors.shape[1]
+
+    rng = np.random.default_rng(42)
+
+    def _make_pairs(n_samples: int) -> tuple[np.ndarray, np.ndarray]:
+        diffs: list[np.ndarray] = []
+        labels: list[int] = []
+        attempts = 0
+        max_attempts = n_samples * 20
+        while len(diffs) < n_samples and attempts < max_attempts:
+            attempts += 1
+            k = int(rng.integers(n_factors))
+            v_k = factors[:, k]
+            unique_vals = np.unique(v_k)
+            if len(unique_vals) < 2:
+                continue
+            fixed_val = rng.choice(unique_vals)
+            idx = np.where(v_k == fixed_val)[0]
+            if len(idx) < 2:
+                continue
+            i1, i2 = rng.choice(idx, size=2, replace=False)
+            diffs.append(np.abs(representations[i1] - representations[i2]))
+            labels.append(k)
+        return np.array(diffs), np.array(labels)
+
+    train_diffs, train_labels = _make_pairs(n_train)
+    eval_diffs, eval_labels = _make_pairs(n_eval)
+
+    if len(train_diffs) == 0 or len(np.unique(train_labels)) < 2:
+        return 0.0
+
+    clf = LogisticRegression(C=1.0, max_iter=1000, random_state=42)
+    clf.fit(train_diffs, train_labels)
+    return float(clf.score(eval_diffs, eval_labels))
+
+
+# ---------------------------------------------------------------------------
 # 4. FactorVAE metric
 # ---------------------------------------------------------------------------
 
@@ -794,8 +863,8 @@ def compute_all_metrics(
     Returns
     -------
     dict
-        Keys: ``"mig"``, ``"modularity"``, ``"sap"``, ``"factorvae"``,
-        ``"dci_disentanglement"``, ``"dci_completeness"``,
+        Keys: ``"beta_vae"``, ``"factorvae"``, ``"mig"``, ``"modularity"``,
+        ``"sap"``, ``"dci_disentanglement"``, ``"dci_completeness"``,
         ``"dci_informativeness_train"``, ``"dci_informativeness_test"``,
         ``"total_correlation"``, ``"latent_correlation_matrix"``
     """
@@ -826,6 +895,9 @@ def compute_all_metrics(
     factors_int = factors.astype(np.int32)
 
     results: Dict[str, Any] = {}
+
+    logger.info("Computing BetaVAE metric…")
+    results["beta_vae"] = beta_vae_metric(representations, factors_int)
 
     logger.info("Computing MIG…")
     results["mig"] = mig_score(representations, factors_int, n_bins=n_bins)
@@ -912,10 +984,11 @@ def compare_models(
 def _print_comparison_table(results: Dict[str, Dict[str, Any]]) -> None:
     """Print a formatted comparison table of scalar metrics."""
     scalar_keys = [
+        "beta_vae",
+        "factorvae",
         "mig",
         "modularity",
         "sap",
-        "factorvae",
         "dci_disentanglement",
         "dci_completeness",
         "dci_informativeness_test",
